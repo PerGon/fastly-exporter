@@ -44,6 +44,7 @@ func main() {
 		productRefresh      time.Duration
 		serviceRefresh      time.Duration
 		dictionaryRefresh   time.Duration
+		backendCertRefresh  time.Duration
 		apiTimeout          time.Duration
 		rtTimeout           time.Duration
 		aggregateOnly       bool
@@ -69,6 +70,7 @@ func main() {
 		fs.DurationVar(&productRefresh, "product-refresh", 10*time.Minute, "how often to poll api.fastly.com for updated product metadata (10m–24h)")
 		fs.DurationVar(&serviceRefresh, "service-refresh", 1*time.Minute, "how often to poll api.fastly.com for updated service metadata (15s–10m)")
 		fs.DurationVar(&dictionaryRefresh, "dictionary-refresh", 5*time.Minute, "how often to poll api.fastly.com for dictionary metadata (1m–24h)")
+		fs.DurationVar(&backendCertRefresh, "backend-cert-refresh", 1*time.Hour, "how often to poll api.fastly.com for backend mTLS client certificate expiry (10m–24h)")
 
 		fs.DurationVar(&serviceRefresh, "api-refresh", 1*time.Minute, "DEPRECATED -- use service-refresh instead")
 		fs.DurationVar(&apiTimeout, "api-timeout", 15*time.Second, "HTTP client timeout for api.fastly.com requests (5–60s)")
@@ -168,6 +170,14 @@ func main() {
 		if dictionaryRefresh > 24*time.Hour {
 			level.Warn(logger).Log("msg", "-dictionary-refresh cannot be longer than 24h; setting it to 24h")
 			dictionaryRefresh = 24 * time.Hour
+		}
+		if backendCertRefresh < 10*time.Minute {
+			level.Warn(logger).Log("msg", "-backend-cert-refresh cannot be shorter than 10m; setting it to 10m")
+			backendCertRefresh = 10 * time.Minute
+		}
+		if backendCertRefresh > 24*time.Hour {
+			level.Warn(logger).Log("msg", "-backend-cert-refresh cannot be longer than 24h; setting it to 24h")
+			backendCertRefresh = 24 * time.Hour
 		}
 		if apiTimeout < 5*time.Second {
 			level.Warn(logger).Log("msg", "-api-timeout cannot be shorter than 5s; setting it to 5s")
@@ -317,6 +327,12 @@ func main() {
 		dictionaryCache = api.NewDictionaryInfoCache(apiClient, token, apiLogger, serviceCache, enabled)
 	}
 
+	var backendCertCache *api.BackendCertCache
+	{
+		enabled := !metricNameFilter.Blocked(prometheus.BuildFQName(namespace, deprecatedSubsystem, "backend_mtls_client_cert_expiry_seconds"))
+		backendCertCache = api.NewBackendCertCache(apiClient, token, apiLogger, serviceCache, enabled)
+	}
+
 	{
 		var g errgroup.Group
 		g.Go(func() error {
@@ -349,6 +365,14 @@ func main() {
 			g.Go(func() error {
 				if err := dictionaryCache.Refresh(context.Background()); err != nil {
 					level.Warn(logger).Log("during", "initial fetch of dictionary info", "err", err, "msg", "dictionary info metrics unavailable, will retry")
+				}
+				return nil
+			})
+		}
+		if backendCertCache.Enabled() {
+			g.Go(func() error {
+				if err := backendCertCache.Refresh(context.Background()); err != nil {
+					level.Warn(logger).Log("during", "initial fetch of backend client certs", "err", err, "msg", "backend client cert metrics unavailable, will retry")
 				}
 				return nil
 			})
@@ -389,6 +413,15 @@ func main() {
 			os.Exit(1)
 		}
 		defaultGatherers = append(defaultGatherers, di)
+	}
+
+	if backendCertCache.Enabled() {
+		bc, err := backendCertCache.Gatherer(namespace, deprecatedSubsystem)
+		if err != nil {
+			level.Error(apiLogger).Log("during", "create backend cert gatherer", "err", err)
+			os.Exit(1)
+		}
+		defaultGatherers = append(defaultGatherers, bc)
 	}
 
 	if !metricNameFilter.Blocked(prometheus.BuildFQName(namespace, deprecatedSubsystem, "token_expiration")) {
@@ -494,6 +527,27 @@ func main() {
 				case <-ticker.C:
 					if err := dictionaryCache.Refresh(ctx); err != nil {
 						level.Warn(apiLogger).Log("during", "dictionary info refresh", "err", err, "msg", "dictionary info metrics may be stale")
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}, func(error) {
+			ticker.Stop()
+			cancel()
+		})
+	}
+	if backendCertCache.Enabled() {
+		var (
+			ctx, cancel = context.WithCancel(context.Background())
+			ticker      = time.NewTicker(backendCertRefresh)
+		)
+		g.Add(func() error {
+			for {
+				select {
+				case <-ticker.C:
+					if err := backendCertCache.Refresh(ctx); err != nil {
+						level.Warn(apiLogger).Log("during", "backend cert refresh", "err", err, "msg", "backend client cert metrics may be stale")
 					}
 				case <-ctx.Done():
 					return ctx.Err()
